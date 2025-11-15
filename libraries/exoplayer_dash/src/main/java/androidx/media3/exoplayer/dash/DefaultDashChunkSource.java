@@ -22,6 +22,7 @@ import static java.lang.Math.min;
 
 import android.net.Uri;
 import android.os.SystemClock;
+import android.util.Log;
 import android.util.Pair;
 import androidx.annotation.CheckResult;
 import androidx.annotation.Nullable;
@@ -35,6 +36,9 @@ import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DataSpec;
 import androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException;
 import androidx.media3.datasource.TransferListener;
+import androidx.media3.datasource.cache.Cache;
+import androidx.media3.datasource.cache.CacheDataSource;
+import androidx.media3.datasource.cache.CacheKeyFactory;
 import androidx.media3.exoplayer.LoadingInfo;
 import androidx.media3.exoplayer.SeekParameters;
 import androidx.media3.exoplayer.analytics.PlayerId;
@@ -55,6 +59,7 @@ import androidx.media3.exoplayer.source.chunk.InitializationChunk;
 import androidx.media3.exoplayer.source.chunk.MediaChunk;
 import androidx.media3.exoplayer.source.chunk.MediaChunkIterator;
 import androidx.media3.exoplayer.source.chunk.SingleSampleMediaChunk;
+import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection;
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
 import androidx.media3.exoplayer.upstream.CmcdData;
@@ -214,6 +219,9 @@ public class DefaultDashChunkSource implements DashChunkSource {
    */
   private long lastChunkRequestRealtimeMs;
 
+  private int cachedRepresentationIndex = -1;
+  private boolean foundNotCachedSegment = false;
+
   /**
    * @param chunkExtractorFactory Creates {@link ChunkExtractor} instances to use for extracting
    *     chunks.
@@ -307,9 +315,9 @@ public class DefaultDashChunkSource implements DashChunkSource {
         long firstSyncUs = representationHolder.getSegmentStartTimeUs(segmentNum);
         long secondSyncUs =
             firstSyncUs < positionUs
-                    && (segmentCount == DashSegmentIndex.INDEX_UNBOUNDED
-                        || segmentNum
-                            < representationHolder.getFirstSegmentNum() + segmentCount - 1)
+                && (segmentCount == DashSegmentIndex.INDEX_UNBOUNDED
+                || segmentNum
+                < representationHolder.getFirstSegmentNum() + segmentCount - 1)
                 ? representationHolder.getSegmentStartTimeUs(segmentNum + 1)
                 : firstSyncUs;
         return seekParameters.resolveSeekPositionUs(positionUs, firstSyncUs, secondSyncUs);
@@ -367,6 +375,54 @@ public class DefaultDashChunkSource implements DashChunkSource {
     return trackSelection.shouldCancelChunkLoad(playbackPositionUs, loadingChunk, queue);
   }
 
+  /**
+   * @return индекс representationHolder-а, который есть в кеше. Иначе -1
+   */
+  private int findCachedIndex() {
+    Integer preloadedRepresentationHolderIndex = null;
+
+    for (int index = 0; index < representationHolders.length; index++) {
+      RepresentationHolder representationHolder = representationHolders[index];
+      Representation selectedRepresentation = representationHolder.representation;
+      RangedUri pendingInitializationUri = null;
+      RangedUri pendingIndexUri = null;
+
+      if (representationHolder.chunkExtractor == null || representationHolder.chunkExtractor.getSampleFormats() == null) {
+        pendingInitializationUri = selectedRepresentation.getInitializationUri();
+      }
+      if (representationHolder.segmentIndex == null) {
+        pendingIndexUri = selectedRepresentation.getIndexUri();
+      }
+
+      if (pendingInitializationUri != null || pendingIndexUri != null) {
+        DataSpec dataSpec = PreloadHelper.buildInitDataSpec(
+            representationHolder.representation,
+            pendingInitializationUri,
+            pendingIndexUri
+        );
+
+        Cache cache = null;
+        CacheKeyFactory cacheKeyFactory = null;
+
+        if (dataSource instanceof CacheDataSource) {
+          cache = ((CacheDataSource) dataSource).getCache();
+          cacheKeyFactory = ((CacheDataSource) dataSource).getCacheKeyFactory();
+        }
+
+        if (cache != null && cacheKeyFactory != null &&
+            PreloadHelper.isDataSpecPreloaded(cache, cacheKeyFactory, dataSpec)) {
+          Log.d("CachePriority","preloaded representation holder founded: height " + representationHolder.representation.format.height);
+          preloadedRepresentationHolderIndex = index;
+          return preloadedRepresentationHolderIndex;
+        }
+      } else {
+        Log.d("CachePriority","[" + index + "] trackType=" + trackType + " pendingInitializationUri and pendingIndexUri are null");
+      }
+    }
+
+    return -1;
+  }
+
   @Override
   public void getNextChunk(
       LoadingInfo loadingInfo,
@@ -386,7 +442,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
 
     if (playerTrackEmsgHandler != null
         && playerTrackEmsgHandler.maybeRefreshManifestBeforeLoadingNextChunk(
-            presentationPositionUs)) {
+        presentationPositionUs)) {
       return;
     }
 
@@ -440,6 +496,44 @@ public class DefaultDashChunkSource implements DashChunkSource {
     lastChunkRequestRealtimeMs = SystemClock.elapsedRealtime();
 
     RepresentationHolder representationHolder = updateSelectedBaseUrl(selectedTrackIndex);
+
+    //region custom code to select quality from cache
+    Format selectedFormat = trackSelection.getSelectedFormat();
+    int selectionReason = trackSelection.getSelectionReason();
+    Object selectionData = trackSelection.getSelectionData();
+
+    if (!foundNotCachedSegment) {
+      if (cachedRepresentationIndex == -1) {
+        cachedRepresentationIndex = findCachedIndex();
+      }
+
+      if (cachedRepresentationIndex != -1) {
+        RepresentationHolder preloadedRepresentationHolder = representationHolders[cachedRepresentationIndex];
+        if (trackSelection instanceof AdaptiveTrackSelection) {
+          ((AdaptiveTrackSelection) trackSelection).lockSelectedIndex(cachedRepresentationIndex);
+        }
+        Log.d("CachePriority", "force to use height" + preloadedRepresentationHolder.representation.format.height + ", lockSelectedIndex " + cachedRepresentationIndex);
+
+        if (representationHolder != preloadedRepresentationHolder) {
+          Log.d("CachePriority","switch to preloaded representationHolder. From: height " + representationHolder.representation.format.height + " to height" + preloadedRepresentationHolder.representation.format.height);
+          representationHolder = preloadedRepresentationHolder;
+
+          Format newFormat = trackSelection.getFormat(cachedRepresentationIndex);
+          if (selectedFormat != newFormat) {
+            Log.d("CachePriority","switch format. From: " + selectedFormat + " to " + newFormat);
+            selectedFormat = newFormat;
+          }
+          Log.d("CachePriority","selectionReason = " + selectionReason);
+          selectionData = null;
+        }
+      } else {
+        Log.d("CachePriority", "cachedRepresentationIndex is null");
+      }
+    } else {
+      Log.d("CachePriority","foundNotCachedSegment do not try found cached initial segment");
+    }
+    //endregion
+
     if (representationHolder.chunkExtractor != null) {
       Representation selectedRepresentation = representationHolder.representation;
       @Nullable RangedUri pendingInitializationUri = null;
@@ -452,16 +546,18 @@ public class DefaultDashChunkSource implements DashChunkSource {
       }
       if (pendingInitializationUri != null || pendingIndexUri != null) {
         // We have initialization and/or index requests to make.
+        //region customCode
         out.chunk =
             newInitializationChunk(
                 representationHolder,
                 dataSource,
-                trackSelection.getSelectedFormat(),
-                trackSelection.getSelectionReason(),
-                trackSelection.getSelectionData(),
+                selectedFormat,
+                selectionReason,
+                selectionData,
                 pendingInitializationUri,
                 pendingIndexUri,
                 cmcdDataFactory);
+        //endregion
         return;
       }
     }
@@ -519,7 +615,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     if (periodDurationUs != C.TIME_UNSET) {
       while (maxSegmentCount > 1
           && representationHolder.getSegmentStartTimeUs(segmentNum + maxSegmentCount - 1)
-              >= periodDurationUs) {
+          >= periodDurationUs) {
         // The period duration clips the period to a position before the last segment in the range
         // [segmentNum, segmentNum + maxSegmentCount - 1]. Reduce maxSegmentCount.
         maxSegmentCount--;
@@ -540,6 +636,29 @@ public class DefaultDashChunkSource implements DashChunkSource {
             seekTimeUs,
             nowPeriodTimeUs,
             cmcdDataFactory);
+
+    if (!foundNotCachedSegment) {
+      Log.d("CachePriority","check that media segment is preloaded");
+
+      Cache cache = null;
+      CacheKeyFactory cacheKeyFactory = null;
+
+      if (dataSource instanceof CacheDataSource) {
+        cache = ((CacheDataSource) dataSource).getCache();
+        cacheKeyFactory = ((CacheDataSource) dataSource).getCacheKeyFactory();
+      }
+
+      if (cache != null && cacheKeyFactory != null &&
+          !PreloadHelper.isDataSpecPreloaded(cache, cacheKeyFactory, out.chunk.dataSpec)) {
+        foundNotCachedSegment = true;
+        if (trackSelection instanceof AdaptiveTrackSelection) {
+          ((AdaptiveTrackSelection) trackSelection).unlockTrackSelection();
+        }
+        Log.d("CachePriority","unlock track selection");
+      }
+    } else {
+      Log.d("CachePriority","skip check that media segment is preloaded because foundNotCachedSegment");
+    }
   }
 
   @Override
@@ -661,7 +780,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     return new LoadErrorHandlingPolicy.FallbackOptions(
         /* numberOfLocations= */ priorityCount,
         /* numberOfExcludedLocations= */ priorityCount
-            - baseUrlExclusionList.getPriorityCountAfterExclusion(baseUrls),
+        - baseUrlExclusionList.getPriorityCountAfterExclusion(baseUrls),
         numberOfTracks,
         numberOfExcludedTracks);
   }
@@ -707,7 +826,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
         ? C.TIME_UNSET
         : nowUnixTimeUs
             - Util.msToUs(
-                manifest.availabilityStartTimeMs + manifest.getPeriod(periodIndex).startMs);
+            manifest.availabilityStartTimeMs + manifest.getPeriod(periodIndex).startMs);
   }
 
   /**
@@ -791,7 +910,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
       long endTimeUs = representationHolder.getSegmentEndTimeUs(firstSegmentNum);
       int flags =
           representationHolder.isSegmentAvailableAtFullNetworkSpeed(
-                  firstSegmentNum, nowPeriodTimeUs)
+              firstSegmentNum, nowPeriodTimeUs)
               ? 0
               : DataSpec.FLAG_MIGHT_NOT_USE_FULL_NETWORK_SPEED;
       DataSpec dataSpec =
@@ -1007,7 +1126,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     }
 
     @CheckResult
-    /* package */ RepresentationHolder copyWithNewRepresentation(
+      /* package */ RepresentationHolder copyWithNewRepresentation(
         long newPeriodDurationUs, Representation newRepresentation)
         throws BehindLiveWindowException {
       @Nullable DashSegmentIndex oldIndex = representation.getIndex();
@@ -1087,7 +1206,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     }
 
     @CheckResult
-    /* package */ RepresentationHolder copyWithNewSegmentIndex(DashSegmentIndex segmentIndex) {
+      /* package */ RepresentationHolder copyWithNewSegmentIndex(DashSegmentIndex segmentIndex) {
       return new RepresentationHolder(
           periodDurationUs,
           representation,
@@ -1098,7 +1217,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     }
 
     @CheckResult
-    /* package */ RepresentationHolder copyWithNewSelectedBaseUrl(BaseUrl selectedBaseUrl) {
+      /* package */ RepresentationHolder copyWithNewSelectedBaseUrl(BaseUrl selectedBaseUrl) {
       return new RepresentationHolder(
           periodDurationUs,
           representation,
@@ -1114,7 +1233,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
 
     public long getFirstAvailableSegmentNum(long nowUnixTimeUs) {
       return checkStateNotNull(segmentIndex)
-              .getFirstAvailableSegmentNum(periodDurationUs, nowUnixTimeUs)
+          .getFirstAvailableSegmentNum(periodDurationUs, nowUnixTimeUs)
           + segmentNumShift;
     }
 
@@ -1129,7 +1248,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     public long getSegmentEndTimeUs(long segmentNum) {
       return getSegmentStartTimeUs(segmentNum)
           + checkStateNotNull(segmentIndex)
-              .getDurationUs(segmentNum - segmentNumShift, periodDurationUs);
+          .getDurationUs(segmentNum - segmentNumShift, periodDurationUs);
     }
 
     public long getSegmentNum(long positionUs) {
@@ -1144,7 +1263,7 @@ public class DefaultDashChunkSource implements DashChunkSource {
     public long getLastAvailableSegmentNum(long nowUnixTimeUs) {
       return getFirstAvailableSegmentNum(nowUnixTimeUs)
           + checkStateNotNull(segmentIndex)
-              .getAvailableSegmentCount(periodDurationUs, nowUnixTimeUs)
+          .getAvailableSegmentCount(periodDurationUs, nowUnixTimeUs)
           - 1;
     }
 

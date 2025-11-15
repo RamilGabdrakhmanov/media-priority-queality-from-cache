@@ -246,9 +246,9 @@ public class AdaptiveTrackSelection extends BaseTrackSelection {
         selections[i] =
             definition.tracks.length == 1
                 ? new FixedTrackSelection(
-                    definition.group,
-                    /* track= */ definition.tracks[0],
-                    /* type= */ definition.type)
+                definition.group,
+                /* track= */ definition.tracks[0],
+                /* type= */ definition.type)
                 : createAdaptiveTrackSelection(
                     definition.group,
                     definition.tracks,
@@ -414,6 +414,24 @@ public class AdaptiveTrackSelection extends BaseTrackSelection {
     latestBitrateEstimate = C.RATE_UNSET_INT;
   }
 
+  @Nullable
+  //Хранит индекс форсированного выбора.
+  //Если != null, то выбор сделан. Иначе - нет и нужно выбирать индекс стандартным механизмом
+  private Integer lockedSelectionIndex = null;
+
+  public void lockSelectedIndex(int index) {
+    if (index >= 0) {
+      lockedSelectionIndex = index;
+      selectedIndex = lockedSelectionIndex;
+    } else {
+      Log.e("AdaptiveTrackSelection","lockSelectedIndex() called with index = " + index);
+    }
+  }
+
+  public void unlockTrackSelection() {
+    lockedSelectionIndex = null;
+  }
+
   @CallSuper
   @Override
   public void enable() {
@@ -442,6 +460,13 @@ public class AdaptiveTrackSelection extends BaseTrackSelection {
       MediaChunkIterator[] mediaChunkIterators) {
     long nowMs = clock.elapsedRealtime();
     long chunkDurationUs = getNextChunkDurationUs(mediaChunkIterators, queue);
+
+    if (lockedSelectionIndex != null) {
+      Log.d("AdaptiveTrackSelection","track selection index locked by " + lockedSelectionIndex);
+      //Раз оказались тут, то сделан форсированный выбор. Далее вычислять выбор необходимости нет. Можно досрочно выйти из метода
+      return;
+    }
+
 
     // Make initial selection
     if (reason == C.SELECTION_REASON_UNKNOWN) {
@@ -684,7 +709,7 @@ public class AdaptiveTrackSelection extends BaseTrackSelection {
             / (next.totalBandwidth - previous.totalBandwidth);
     return previous.allocatedBandwidth
         + (long)
-            (fractionBetweenCheckpoints * (next.allocatedBandwidth - previous.allocatedBandwidth));
+        (fractionBetweenCheckpoints * (next.allocatedBandwidth - previous.allocatedBandwidth));
   }
 
   private long getTotalAllocatableBandwidth(long chunkDurationUs) {
